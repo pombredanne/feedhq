@@ -448,7 +448,10 @@ class JobDataMixin(object):
 
     @property
     def last_update(self):
-        update = self.job_details.get('last_update')
+        try:
+            update = self.job_details.get('last_update')
+        except JobNotFound:
+            return
         if update is not None:
             return epoch_to_utc(update)
 
@@ -680,7 +683,7 @@ class Entry(models.Model):
         feedparser._HTMLSanitizer.mathml_elements |
         feedparser._HTMLSanitizer.svg_elements |
         set(['iframe', 'object', 'embed', 'script'])
-    )
+    ) - set(['font'])
     ATTRIBUTES = (
         feedparser._HTMLSanitizer.acceptable_attributes |
         feedparser._HTMLSanitizer.mathml_attributes |
@@ -749,7 +752,7 @@ class Entry(models.Model):
         return netloc.replace('www.', '')
 
     def tweet(self):
-        return u"{title} — {link} via @FeedHQ".format(
+        return u"{title} — {link}".format(
             title=self.title, link=self.link)
 
     def read_later(self):

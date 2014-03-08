@@ -1,5 +1,6 @@
 import json
 import logging
+import re
 import struct
 import urlparse
 
@@ -10,9 +11,8 @@ import opml
 
 from django.core.cache import cache
 from django.core.exceptions import ValidationError
-from django.core.validators import email_re
-from django.db import connection, transaction
-from django.db.models import Max, Sum, Min, Q
+from django.db import connection
+from django.db.models import Sum, Q
 from django.http import Http404
 from django.shortcuts import render
 from django.utils import timezone
@@ -31,6 +31,7 @@ from ..feeds.models import Feed, UniqueFeed, Category
 from ..feeds.utils import epoch_to_utc
 from ..feeds.views import save_outline
 from ..profiles.models import User
+from ..utils import is_email
 from .authentication import GoogleLoginAuthentication
 from .exceptions import PermissionDenied, BadToken
 from .models import generate_auth_token, generate_post_token, check_post_token
@@ -39,6 +40,8 @@ from .renderers import (PlainRenderer, GoogleReaderXMLRenderer, AtomRenderer,
 
 
 logger = logging.getLogger(__name__)
+
+MISSING_SLASH_RE = re.compile("^(https?:\/)[^\/]")
 
 
 def item_id(value):
@@ -96,6 +99,15 @@ def is_label(value, user_id):
     return False
 
 
+def feed_url(stream):
+    url = stream[len('feed/'):]
+    missing_slash = MISSING_SLASH_RE.match(url)
+    if missing_slash:
+        start = missing_slash.group(1)
+        url = u'{0}/{1}'.format(start, url[len(start):])
+    return url
+
+
 class ForceNegotiation(DefaultContentNegotiation):
     """
     Forces output even if ?output= is wrong when we have
@@ -139,10 +151,11 @@ class Login(APIView):
         self.querydict = querydict
 
     def post(self, request, *args, **kwargs):
-        if email_re.search(self.querydict['Email']):
+        if is_email(self.querydict['Email']):
             clause = Q(email__iexact=self.querydict['Email'])
         else:
             clause = Q(username__iexact=self.querydict['Email'])
+        clause = clause & Q(is_active=True)
         try:
             user = User.objects.get(clause)
         except User.DoesNotExist:
@@ -249,34 +262,44 @@ class UnreadCount(ReaderView):
     http_method_names = ['get']
 
     def get(self, request, *args, **kwargs):
-        feeds = request.user.feeds.filter(
-            unread_count__gt=0).annotate(ts=Max('entries__date'))
+        feeds = request.user.feeds.filter(unread_count__gt=0)
+        last_updates = request.user.last_updates()
+        unread_counts = []
+        forced = False
         for feed in feeds:
-            if not feed.ts:
-                feed.ts = timezone.now()
-        unread_counts = [{
-            "id": u"feed/{0}".format(feed.url),
-            "count": feed.unread_count,
-            "newestItemTimestampUsec": feed.ts.strftime("%s000000"),
-        } for feed in feeds]
+            if feed.url not in last_updates and not forced:
+                last_updates = request.user.refresh_updates()
+                forced = True
+            feed_data = {
+                "id": u"feed/{0}".format(feed.url),
+                "count": feed.unread_count,
+            }
+            ts = last_updates[feed.url]
+            if ts:
+                feed_data['newestItemTimestampUsec'] = '{0}000000'.format(ts)
+            unread_counts.append(feed_data)
 
         # We can't annotate with Max('feeds__entries__date') when fetching the
         # categories since it creates duplicates and returns wrong counts.
         cat_ts = {}
         for feed in feeds:
-            if feed.category_id in cat_ts:
+            if feed.category_id in cat_ts and last_updates[feed.url]:
                 cat_ts[feed.category_id] = max(cat_ts[feed.category_id],
-                                               feed.ts)
-            else:
-                cat_ts[feed.category_id] = feed.ts
+                                               last_updates[feed.url])
+            elif last_updates[feed.url]:
+                cat_ts[feed.category_id] = last_updates[feed.url]
         categories = request.user.categories.annotate(
             unread_count=Sum('feeds__unread_count'),
         ).filter(unread_count__gt=0)
-        unread_counts += [{
-            "id": label_key(request, cat),
-            "count": cat.unread_count,
-            "newestItemTimestampUsec": cat_ts[cat.pk].strftime("%s000000"),
-        } for cat in categories]
+        for cat in categories:
+            info = {
+                "id": label_key(request, cat),
+                "count": cat.unread_count,
+            }
+            if cat.pk in cat_ts:
+                info["newestItemTimestampUsec"] = '{0}000000'.format(
+                    cat_ts[cat.pk])
+            unread_counts.append(info)
 
         # Special items:
         # reading-list is the global counter
@@ -285,8 +308,8 @@ class UnreadCount(ReaderView):
                 "id": "user/{0}/state/com.google/reading-list".format(
                     request.user.pk),
                 "count": sum([f.unread_count for f in feeds]),
-                "newestItemTimestampUsec": max(
-                    cat_ts.values()).strftime("%s000000"),
+                "newestItemTimestampUsec": '{0}000000'.format(max(
+                    cat_ts.values())),
             }]
         return Response({
             "max": 1000,
@@ -380,9 +403,8 @@ class SubscriptionList(ReaderView):
     http_method_names = ['get']
 
     def get(self, request, *args, **kwargs):
-        feeds = request.user.feeds.annotate(
-            ts=Min('entries__date'),
-        ).select_related('category').order_by('category__name', 'name')
+        feeds = request.user.feeds.select_related('category',).order_by(
+            'category__name', 'name')
         uniques = UniqueFeed.objects.filter(url__in=[f.url for f in feeds])
         unique_map = {}
         for unique in uniques:
@@ -397,18 +419,14 @@ class SubscriptionList(ReaderView):
                 "categories": [],
                 "sortid": "B{0}".format(str(index).zfill(7)),
                 "htmlUrl": unique_map.get(feed.url, feed.url),
+                "firstitemmsec": (timezone.now() - timedelta(
+                    days=request.user.ttl or 365)).strftime("%s000"),
             }
             if feed.category is not None:
                 subscription['categories'].append({
                     "id": label_key(request, feed.category),
                     "label": feed.category.name,
                 })
-            if feed.ts is not None:
-                try:
-                    subscription["firstitemmsec"] = feed.ts.strftime("%s000")
-                except ValueError as e:
-                    if 'is before 1900' not in e.args[0]:
-                        raise
             subscriptions.append(subscription)
         return Response({
             "subscriptions": subscriptions
@@ -431,7 +449,7 @@ class EditSubscription(ReaderView):
         if not request.DATA['s'].startswith('feed/'):
             raise exceptions.ParseError(
                 u"Unrecognized stream: {0}".format(request.DATA['s']))
-        url = request.DATA['s'][len('feed/'):]
+        url = feed_url(request.DATA['s'])
 
         if action == 'subscribe':
             form = FeedForm(data={'url': url}, user=request.user)
@@ -487,7 +505,7 @@ class QuickAddSubscription(ReaderView):
 
         url = request.DATA['quickadd']
         if url.startswith('feed/'):
-            url = url[len('feed/'):]
+            url = feed_url(url)
 
         form = FeedForm(data={'url': url}, user=request.user)
         if not form.is_valid():
@@ -518,7 +536,7 @@ class Subscribed(ReaderView):
         if not feed.startswith('feed/'):
             raise exceptions.ParseError(
                 "Unrecognized feed format. Use 'feed/<url>'")
-        url = feed[len('feed/'):]
+        url = feed_url(feed)
         return Response(str(
             request.user.feeds.filter(url=url).exists()
         ).lower())
@@ -529,7 +547,7 @@ def get_q(stream, user_id, exception=False):
     """Given a stream ID, returns a Q object for this stream."""
     stream_q = None
     if stream.startswith("feed/"):
-        url = stream[len("feed/"):]
+        url = feed_url(stream)
         stream_q = Q(feed__url=url)
     elif is_stream(stream, user_id):
         state = is_stream(stream, user_id)
@@ -729,7 +747,7 @@ class StreamContents(ReaderView):
         }
 
         if content_id.startswith("feed/"):
-            url = content_id[len("feed/"):]
+            url = feed_url(content_id)
             feeds = request.user.feeds.filter(url=url).order_by('pk')[:1]
             if len(feeds) == 0:
                 raise Http404
@@ -1035,7 +1053,7 @@ class MarkAllAsRead(ReaderView):
         stream = request.DATA['s']
 
         if stream.startswith('feed/'):
-            url = stream[len('feed/'):]
+            url = feed_url(stream)
             entries = entries.filter(feed__url=url)
         elif is_label(stream, request.user.pk):
             name = is_label(stream, request.user.pk)
@@ -1066,7 +1084,6 @@ class MarkAllAsRead(ReaderView):
                 where e.feed_id = f.id and read = false
             ) where f.user_id = %s
         """, [request.user.pk])
-        transaction.commit_unless_managed()
         return Response("OK")
 mark_all_as_read = MarkAllAsRead.as_view()
 

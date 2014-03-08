@@ -249,6 +249,12 @@ class ReaderApiTest(ApiTest):
                                    **clientlogin(token))
         self.assertContains(response, 'true')
 
+        # Bogus URL with one slash
+        feed_url = 'http:/example.com/subscribed-feed'
+        response = self.client.get(url, {'s': 'feed/{0}'.format(feed_url)},
+                                   **clientlogin(token))
+        self.assertContains(response, 'true')
+
     def test_edit_tag(self, get):
         get.return_value = responses(304)
         user = UserFactory.create()
@@ -414,11 +420,15 @@ class ReaderApiTest(ApiTest):
 
         feed = FeedFactory.create(category__user=user, user=user)
         for i in range(5):
-            EntryFactory.create(feed=feed, read=False)
+            EntryFactory.create(feed=feed, read=False, user=user)
         feed2 = FeedFactory.create(category=None, user=user)
-        EntryFactory.create(feed=feed2, read=False)
+        EntryFactory.create(feed=feed2, read=False, user=user)
         feed.update_unread_count()
         feed2.update_unread_count()
+
+        # need to populate last updates, extra queries required
+        with self.assertNumQueries(5):
+            response = self.client.get(url, **clientlogin(token))
 
         with self.assertNumQueries(2):
             response = self.client.get(url, **clientlogin(token))
@@ -648,8 +658,17 @@ class ReaderApiTest(ApiTest):
         self.assertEqual(len(response.json['items']), 0)
 
         UniqueFeed.objects.all().delete()
+        feed_url = user.feeds.all()[0].url
         url = reverse('reader:stream_contents',
-                      args=[u'feed/{0}'.format(user.feeds.all()[0].url)])
+                      args=[u'feed/{0}'.format(feed_url)])
+        with self.assertNumQueries(4):
+            response = self.client.get(url, {'n': 40, 'output': 'atom'},
+                                       **clientlogin(token))
+            self.assertEqual(response.status_code, 200)
+
+        feed_url = feed_url.replace('://', ':/')
+        url = reverse('reader:stream_contents',
+                      args=[u'feed/{0}'.format(feed_url)])
         with self.assertNumQueries(4):
             response = self.client.get(url, {'n': 40, 'output': 'atom'},
                                        **clientlogin(token))

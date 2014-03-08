@@ -193,6 +193,9 @@ class UpdateTests(ClearRedisTestCase):
         with self.assertNumQueries(2):  # no insert
             store_entries(feed.url, data)
 
+        last_updates = feed.user.last_updates()
+        self.assertEqual(last_updates, {})
+
         feed2 = FeedFactory.create(url=feed.url)
         self.assertEqual(UniqueFeed.objects.count(), 1)
         call_command('delete_unsubscribed')
@@ -208,6 +211,8 @@ class UpdateTests(ClearRedisTestCase):
 
         self.assertEqual(feed.entries.count(), 0)
         self.assertEqual(feed2.entries.count(), 30)
+        last_updates = feed2.user.last_updates()
+        self.assertEqual(last_updates.keys(), [feed2.url])
 
     @patch('requests.get')
     def test_same_guids(self, get):
@@ -340,6 +345,7 @@ class UpdateTests(ClearRedisTestCase):
                 u'hub.verify': [u'sync', u'async'],
                 u'hub.topic': feed.url,
                 u'hub.mode': u'subscribe'},
+            timeout=None,
             auth=None)
         self.assertEqual(feed.url, subscription.topic)
 
@@ -359,6 +365,7 @@ class UpdateTests(ClearRedisTestCase):
                 u'hub.verify': [u'sync', u'async'],
                 u'hub.topic': feed.url,
                 u'hub.mode': u'subscribe'},
+            timeout=None,
             auth=None)
 
         post.reset_mock()
@@ -376,6 +383,7 @@ class UpdateTests(ClearRedisTestCase):
                 u'hub.verify': [u'sync', u'async'],
                 u'hub.topic': feed.url,
                 u'hub.mode': u'subscribe'},
+            timeout=None,
             auth=None)
 
         post.reset_mock()
